@@ -1,0 +1,6 @@
+venv/
+venv/
+token.pickle
+token.json
+credentials.json
+sofia.env
