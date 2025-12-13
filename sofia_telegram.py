@@ -1,79 +1,104 @@
+# ==========================================
+# Sofia Telegram Bot - Versión limpia Render
+# ==========================================
+print("=== SOFIA_DEPLOY_MARK_20251201 ===")
 import os
+import base64
 import logging
-import pickle
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 from openai import OpenAI
-from googleapiclient.discovery import build
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
 
-# === Configuración de logging ===
-logging.basicConfig(
-    filename="sofia.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
-logger = logging.getLogger(__name__)
 
-# === Lista global para mapear números -> IDs de correos ===
-correo_ids = []
+# ========= Cargar entorno =========
+from dotenv import dotenv_values
 
-# === Cargar claves desde sofia.env ===
-load_dotenv("sofia.env")
+env = dotenv_values("sofia.env")
+for k, v in env.items():
+    os.environ[k] = v
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+print("DEBUG — TELEGRAM_TOKEN leído:", TELEGRAM_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# === Gmail API Config ===
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+logging.basicConfig(
+    filename="sofia.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
+
+# ======================================================
+# 🔥 GMAIL SERVICE (VERSIÓN 100% COMPATIBLE CON RENDER)
+# ======================================================
 def get_gmail_service():
-    creds = None
-    if os.path.exists("token.pickle"):
-        with open("token.pickle", "rb") as token:
-            creds = pickle.load(token)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open("token.pickle", "wb") as token:
-            pickle.dump(creds, token)
-    return build("gmail", "v1", credentials=creds)
+    """
+    Gmail service SIN navegador (Render-safe).
+    Usa GMAIL_TOKEN_JSON (un JSON en una sola línea) y refresca con refresh_token.
+    """
+    import json
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
 
-def find_attachments(payload):
-    """Busca recursivamente todos los adjuntos en el payload de Gmail."""
-    attachments = []
+    SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
-    def walk(part):
-        fn = part.get("filename") or ""
-        body = part.get("body", {}) or {}
-        if fn and "attachmentId" in body:
-            attachments.append((fn, body["attachmentId"]))
-        for sub in part.get("parts", []) or []:
-            walk(sub)
+    token_json = os.getenv("GMAIL_TOKEN_JSON")
+    print("✅ DEBUG get_gmail_service: usando GMAIL_TOKEN_JSON + json.loads (sin navegador)")
+    if not token_json:
+        raise RuntimeError("Falta la variable de entorno GMAIL_TOKEN_JSON")
 
-    walk(payload)
-    return attachments
+    try:
+        d = json.loads(token_json)
+    except Exception as e:
+        raise RuntimeError(f"GMAIL_TOKEN_JSON no es JSON válido: {e}")
 
-# === Handlers ===
-
-# /start → bienvenida
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Hola, soy Sofía. Te ayudo con tus correos.\nUsa /correos, /buscar <palabra>, /resumen."
+    creds = Credentials(
+        token=d.get("token"),
+        refresh_token=d.get("refresh_token"),
+        token_uri=d.get("token_uri"),
+        client_id=d.get("client_id"),
+        client_secret=d.get("client_secret"),
+        scopes=SCOPES,
     )
 
-# === /correos: lista 5 no leídos, numerados y guarda sus IDs ===
+    # Refrescar si expira (SIN navegador)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+
+    # Si sigue inválido, fallar claro (y NO intentar navegador)
+    if not creds.valid:
+        raise RuntimeError("Token Gmail inválido o sin refresh_token (no se puede refrescar sin navegador).")
+
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+# ======================================================
+# /correos – listar no leídos
+# ======================================================
+correo_ids = []
+
 async def listar_correos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global correo_ids
+
+    # Mensaje inicial
+    await update.message.reply_text("📥 Cargando correos, dame unos segundos...")
+
     try:
         service = get_gmail_service()
+
         res = service.users().messages().list(
             userId="me",
             labelIds=["INBOX"],
@@ -86,130 +111,105 @@ async def listar_correos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("📭 No tienes correos no leídos.")
             return
 
-        correo_ids = []  # reiniciar IDs cada vez que listamos
-        response_text = "📌 Últimos 5 correos no leídos:\n\n"
+        correo_ids = []  # reiniciar IDs
+        lineas = ["📌 Últimos 5 correos no leídos:\n"]
 
         for i, msg in enumerate(messages, start=1):
-            correo_ids.append(msg["id"])   # guardar ID para usar con /leer
-            msg_data = service.users().messages().get(userId='me', id=msg['id']).execute()
-            payload = msg_data['payload']
-            headers = payload.get('headers', [])
+            msg_id = msg["id"]
+            correo_ids.append(msg_id)
 
-            remitente = next((h['value'] for h in headers if h['name'] == 'From'), "Desconocido")
-            asunto = next((h['value'] for h in headers if h['name'] == 'Subject'), "Sin asunto")
-            fecha = next((h['value'] for h in headers if h['name'] == 'Date'), "Sin fecha")
+            msg_data = service.users().messages().get(
+                userId="me",
+                id=msg_id,
+                format="metadata",
+                metadataHeaders=["From", "Subject", "Date"]
+            ).execute()
 
-            response_text += f"{i}. {asunto} — {remitente} — {fecha}\n"
+            headers = {h["name"]: h["value"] for h in msg_data["payload"].get("headers", [])}
+            remitente = headers.get("From", "Desconocido")
+            asunto = headers.get("Subject", "Sin asunto")
+            fecha = headers.get("Date", "Sin fecha")
 
-        await update.message.reply_text(response_text)
+            lineas.append(f"📩 {i}. {asunto}\nDe: {remitente}\nFecha: {fecha}\n")
+
+        await update.message.reply_text("".join(lineas))
 
     except Exception as e:
+        import traceback
+        print("=== TRACEBACK /correos ===")
+        print(traceback.format_exc())
+        print("=== FIN TRACEBACK ===")
         logger.exception("Error en /correos")
         await update.message.reply_text(f"⚠️ Error al listar correos: {e}")
 
-# /buscar <palabra> → busca correos por palabra clave
-async def buscar_correos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("⚠️ Usa: /buscar <palabra>")
-        return
-
-    palabra = " ".join(context.args)
-    try:
-        service = get_gmail_service()
-        results = service.users().messages().list(userId="me", q=palabra, maxResults=5).execute()
-        messages = results.get("messages", [])
-
-        if not messages:
-            await update.message.reply_text(f"🔎 No encontré correos con '{palabra}'.")
-            return
-
-        response = f"🔎 Resultados con '{palabra}':\n"
-        for msg in messages:
-            m = service.users().messages().get(userId="me", id=msg["id"]).execute()
-            payload = m['payload']
-            headers = payload.get('headers', [])
-
-            remitente = next((h['value'] for h in headers if h['name'] == 'From'), "Desconocido")
-            asunto = next((h['value'] for h in headers if h['name'] == 'Subject'), "Sin asunto")
-            fecha = next((h['value'] for h in headers if h['name'] == 'Date'), "Sin fecha")
-
-            response += f"- {asunto} — {remitente} — {fecha}\n"
-
-        await update.message.reply_text(response)
-
-    except Exception as e:
-        logger.exception("Error en /buscar")
-        await update.message.reply_text(f"⚠️ Error al buscar correos: {e}")
-
-# /resumen → resume últimos 5 correos no leídos
+# ======================================================
+# /resumen – Resumir últimos 5 correos
+# ======================================================
 async def resumen_correos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global correo_ids
     try:
         service = get_gmail_service()
-        results = service.users().messages().list(
-            userId='me',
-            labelIds=['INBOX', 'UNREAD'],
+        res = service.users().messages().list(
+            userId="me",
+            labelIds=["INBOX"],
+            q="is:unread",
             maxResults=5
         ).execute()
-        messages = results.get('messages', [])
 
-        if not messages:
-            await update.message.reply_text("📭 No tienes correos no leídos para resumir.")
+        mensajes = res.get("messages", [])
+        if not mensajes:
+            await update.message.reply_text("📭 No tienes correos no leídos.")
             return
 
-        response_text = "📌 Resúmenes de los últimos 5 correos no leídos:\n\n"
-        correo_ids = []   # reiniciar IDs cada vez que listamos
+        texto_final = "📌 *Resúmenes de los últimos 5 correos:* \n\n"
+        import base64
 
-        for i, msg in enumerate(messages, start=1):
-            correo_ids.append(msg["id"])
-            msg_data = service.users().messages().get(userId='me', id=msg['id']).execute()
-            payload = msg_data['payload']
-            headers = payload.get('headers', [])
+        for i, msg in enumerate(mensajes, start=1):
+            msg_data = service.users().messages().get(
+                userId="me",
+                id=msg["id"],
+                format="full"
+            ).execute()
 
-            remitente = next((h['value'] for h in headers if h['name'] == 'From'), "Desconocido")
-            asunto = next((h['value'] for h in headers if h['name'] == 'Subject'), "Sin asunto")
-            fecha = next((h['value'] for h in headers if h['name'] == 'Date'), "Sin fecha")
+            payload = msg_data.get("payload", {})
+            headers = payload.get("headers", [])
 
-            response_text += (
-                f"📩 {i}. Asunto: {asunto}\n"
-                f"De: {remitente}\n"
-                f"Fecha: {fecha}\n"
-                f"---\n"
-            )
+            remitente = next((h["value"] for h in headers if h["name"] == "From"), "Desconocido")
+            asunto = next((h["value"] for h in headers if h["name"] == "Subject"), "Sin asunto")
 
-            # Adjuntos
-            adjuntos = []
-            for part in payload.get("parts", []):
-                if part.get("filename"):
-                    adjuntos.append(part["filename"])
-            if adjuntos:
-                response_text += f"📎 Adjuntos: {', '.join(adjuntos)}\n"
+            cuerpo = ""
+            if "parts" in payload:
+                for part in payload["parts"]:
+                    if part.get("mimeType") == "text/plain":
+                        data = part.get("body", {}).get("data")
+                        if data:
+                            cuerpo = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                            break
 
-        await update.message.reply_text(response_text)
+            if not cuerpo:
+                cuerpo = "(Sin texto legible)"
+
+            # === RESUMEN CON IA ===
+            resumen = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Resume este correo en un párrafo corto."},
+                    {"role": "user", "content": cuerpo}
+                ],
+                max_tokens=120
+            ).choices[0].message.content.strip()
+
+            texto_final += f"📩 *{i}. {asunto}*\n"
+            texto_final += f"👤 {remitente}\n"
+            texto_final += f"🧠 {resumen}\n\n"
+
+        await update.message.reply_text(texto_final, parse_mode="Markdown")
 
     except Exception as e:
-        logger.exception("Error en /resumen")
-        await update.message.reply_text(f"⚠️ Error al resumir correos: {e}")
+        await update.message.reply_text(f"⚠️ Error al crear el resumen: {e}")
 
-# /leer <número> → abre un correo específico por su número en la lista
-# === Función auxiliar para buscar adjuntos (recursiva) ===
-def find_attachments(payload):
-    """Busca recursivamente todos los adjuntos en el payload de Gmail."""
-    attachments = []
-
-    def walk(part):
-        fn = part.get("filename") or ""
-        body = part.get("body", {}) or {}
-        if fn and "attachmentId" in body:
-            attachments.append((fn, body["attachmentId"]))
-        for sub in part.get("parts", []) or []:
-            walk(sub)
-
-    walk(payload)
-    return attachments
-
-
-# === /leer → Lee y resume el correo N ===
+# ======================================================
+# /leer <n> – mostrar contenido
+# ======================================================
 async def leer_correo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global correo_ids
     try:
@@ -217,171 +217,170 @@ async def leer_correo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Usa: /leer <número>")
             return
 
-        num = int(context.args[0])
-        if num < 1 or num > len(correo_ids):
-            await update.message.reply_text("⚠️ Número fuera de rango. Primero ejecuta /correos para ver la lista.")
+        n = int(context.args[0])
+        if n < 1 or n > len(correo_ids):
+            await update.message.reply_text("⚠️ Número fuera de rango. Ejecuta /correos primero.")
             return
-
+        await update.message.reply_text("📥 Cargando correo, por favor espera...")
         service = get_gmail_service()
-        correo_id = correo_ids[num - 1]
+        msg_id = correo_ids[n - 1]
 
-        msg = service.users().messages().get(userId='me', id=correo_id, format='full').execute()
-        payload = msg.get('payload', {})
-        headers = payload.get('headers', [])
-
-        remitente = next((h['value'] for h in headers if h['name'] == 'From'), "Desconocido")
-        asunto = next((h['value'] for h in headers if h['name'] == 'Subject'), "Sin asunto")
-        fecha = next((h['value'] for h in headers if h['name'] == 'Date'), "Sin fecha")
-
-        # Obtener cuerpo del correo
-        cuerpo = ""
-        if "parts" in payload:
-            for part in payload["parts"]:
-                if part.get("mimeType") == "text/plain":
-                    import base64
-                    cuerpo += base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="ignore")
-        elif "body" in payload and "data" in payload["body"]:
-            import base64
-            cuerpo += base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="ignore")
-
-        # Resumir contenido con GPT
-        resumen = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Eres un asistente que resume correos en español de forma clara y concisa."},
-                {"role": "user", "content": f"Resume este correo en máximo 3 frases:\n{cuerpo}"}
-            ]
-        )
-        resumen_texto = resumen.choices[0].message.content.strip()
-
-        # Buscar adjuntos (robusto)
-        attachments = find_attachments(payload)
-        tiene_adjuntos = len(attachments) > 0
-
-        # Armar respuesta
-        response_text = f"📩 *Asunto:* {asunto}\n"
-        response_text += f"👤 *De:* {remitente}\n"
-        response_text += f"🕒 *Fecha:* {fecha}\n\n"
-        response_text += f"📝 *Resumen:* {resumen_texto}\n"
-
-        if tiene_adjuntos:
-            response_text += "\n📎 *Adjuntos encontrados:*\n"
-            for fn, _ in attachments:
-                response_text += f"   • {fn}\n"
-
-        await update.message.reply_text(response_text, parse_mode="Markdown")
-
-    except Exception as e:
-        logger.exception("Error al leer correo")
-        await update.message.reply_text(f"⚠️ Error al leer el correo: {e}")
-        await update.message.reply_text(f"⚠️ No se encontró adjunto con el nombre: {nombre_adjunto}")
-
-    except Exception as e:
-        logger.exception("Error en /adjunto")
-        await update.message.reply_text(f"⚠️ Error al enviar adjunto: {e}")
-
-# === /adjunto → envía un archivo adjunto del correo N ===
-async def enviar_adjunto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global correo_ids
-    if not context.args:
-        await update.message.reply_text(
-            "⚠️ Usa: /adjunto <número> [<nombre>|<índice>]\n"
-            "Ejemplo: /adjunto 2 factura.pdf  ó  /adjunto 2 1"
-        )
-        return
-
-    # Validar que el primer argumento sea número
-    try:
-        num = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text(
-            "⚠️ El primer parámetro debe ser un número. Ejemplo: /adjunto 2 factura.pdf"
-        )
-        return
-
-    if num < 1 or num > len(correo_ids):
-        await update.message.reply_text(
-            "⚠️ Número fuera de rango. Primero ejecuta /correos para ver la lista."
-        )
-        return
-
-    try:
-        service = get_gmail_service()
-        correo_id = correo_ids[num - 1]
-        msg = service.users().messages().get(userId='me', id=correo_id, format='full').execute()
-        payload = msg.get('payload', {}) or {}
-
-        # Buscar adjuntos (robusto)
-        attachments = find_attachments(payload)
-        if not attachments:
-            await update.message.reply_text("ℹ️ Ese correo no tiene adjuntos.")
-            return
-
-        # Si solo pusieron el número, listar los adjuntos
-        if len(context.args) == 1:
-            lista = "\n".join(f"{i+1}. {fn}" for i, (fn, _) in enumerate(attachments))
-            await update.message.reply_text(
-                f"📎 Adjuntos disponibles en el correo {num}:\n{lista}\n\n"
-                f"Para enviarlo: /adjunto {num} <nombre> o /adjunto {num} <índice>"
-            )
-            return
-
-        criterio = " ".join(context.args[1:]).strip()
-        elegido = None
-
-        # Buscar por índice
-        try:
-            idx = int(criterio) - 1
-            if 0 <= idx < len(attachments):
-                elegido = attachments[idx]
-        except ValueError:
-            pass
-
-        # Buscar por nombre (exacto o parcial)
-        if elegido is None:
-            crit_low = criterio.lower()
-            for fn, aid in attachments:
-                if crit_low in fn.lower():
-                    elegido = (fn, aid)
-                    break
-
-        if elegido is None:
-            lista = "\n".join(f"{i+1}. {fn}" for i, (fn, _) in enumerate(attachments))
-            await update.message.reply_text(
-                f"⚠️ No encontré un adjunto que coincida con '{criterio}'.\n\nAdjuntos disponibles:\n{lista}"
-            )
-            return
-
-        # Descargar y enviar el adjunto
-        fn, attach_id = elegido
-        data = service.users().messages().attachments().get(
-            userId='me', messageId=correo_id, id=attach_id
+        msg = service.users().messages().get(
+            userId="me", id=msg_id, format="full"
         ).execute()
 
-        import base64
-        from io import BytesIO
-        file_bytes = base64.urlsafe_b64decode(data["data"])
-        bio = BytesIO(file_bytes)
-        bio.name = fn
+        payload = msg["payload"]
+        headers = payload.get("headers", [])
 
-        await update.message.reply_document(document=bio)
+        remitente = next((h["value"] for h in headers if h["name"] == "From"), "Desconocido")
+        asunto = next((h["value"] for h in headers if h["name"] == "Subject"), "Sin asunto")
+        fecha = next((h["value"] for h in headers if h["name"] == "Date"), "Sin fecha")
+
+        # Extraer cuerpo ----------------------------------------------------
+        def obtener_texto(partes):
+            for part in partes:
+                data = part.get("body", {}).get("data")
+                if data:
+                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+
+                if "parts" in part:
+                    t = obtener_texto(part["parts"])
+                    if t:
+                        return t
+            return None
+
+        cuerpo = ""
+        if "parts" in payload:
+            cuerpo = obtener_texto(payload["parts"]) or ""
+        elif "data" in payload.get("body", {}):
+            cuerpo = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8")
+
+        if not cuerpo:
+            cuerpo = "(No contiene texto legible)"
+
+        mensaje = (
+            f"Asunto: {asunto}\n"
+            f"De: {remitente}\n"
+            f"Fecha: {fecha}\n\n"
+            f"{cuerpo}"
+        )
+
+        for i in range(0, len(mensaje), 4000):
+            await update.message.reply_text(
+                mensaje[i:i+4000],
+                parse_mode=None
+            )
 
     except Exception as e:
-        logger.exception("Error en /adjunto")
-        await update.message.reply_text(f"⚠️ Error al enviar adjunto: {e}")
+        logger.exception("Error en /leer")
+        await update.message.reply_text(f"⚠️ Error al leer correo: {e}")
 
-# === main ===
+
+# ======================================================
+# /buscar <palabra>
+# ======================================================
+async def buscar_correos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global correo_ids
+
+    try:
+        if not context.args:
+            await update.message.reply_text("⚠️ Usa: /buscar <palabra>")
+            return
+
+        palabra = " ".join(context.args)
+        service = get_gmail_service()
+
+        res = service.users().messages().list(
+            userId="me",
+            q=palabra,
+            maxResults=5
+        ).execute()
+
+        messages = res.get("messages", [])
+        if not messages:
+            await update.message.reply_text("📭 No se encontraron correos.")
+            return
+
+        correo_ids = []
+        texto = f"🔍 Resultados para '{palabra}':\n\n"
+
+        for i, msg in enumerate(messages, start=1):
+            correo_ids.append(msg["id"])
+            full = service.users().messages().get(userId="me", id=msg["id"]).execute()
+            headers = full["payload"].get("headers", [])
+
+            remitente = next((h["value"] for h in headers if h["name"] == "From"), "Desconocido")
+            asunto = next((h["value"] for h in headers if h["name"] == "Subject"), "Sin asunto")
+            fecha = next((h["value"] for h in headers if h["name"] == "Date"), "Sin fecha")
+
+            texto += f"📩 {i}. {asunto} — {remitente} — {fecha}\n"
+
+        await update.message.reply_text(texto)
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error en /buscar: {e}")
+
+
+# ======================================================
+# /hora
+# ======================================================
+async def hora_actual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    await update.message.reply_text(f"🕒 Hora actual: {ahora}")
+
+
+# ======================================================
+# /texto normal → ChatGPT
+# ======================================================
+async def responder_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        respuesta = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Eres Sofía, una asistente amable y clara."},
+                {"role": "user", "content": update.message.text}
+            ]
+        )
+        await update.message.reply_text(respuesta.choices[0].message.content)
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error: {e}")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Hola, soy Sofía.\nUsa /correos para ver tus correos."
+    )
+# === DEBUG seguro (NO imprime el token) ===
+_g = os.getenv("GMAIL_TOKEN_JSON")
+print("DEBUG Render → GMAIL_TOKEN_JSON existe?:", bool(_g))
+print("DEBUG Render → Longitud GMAIL_TOKEN_JSON:", len(_g) if _g else 0)
+print("=== BOOT SOFIA ===")
+print("TELEGRAM_TOKEN existe?:", bool(os.getenv("TELEGRAM_TOKEN")))
+print("GMAIL_TOKEN_JSON existe?:", bool(os.getenv("GMAIL_TOKEN_JSON")))
+t = os.getenv("GMAIL_TOKEN_JSON") or ""
+print("GMAIL_TOKEN_JSON longitud:", len(t))
+print("=== FIN BOOT ===")
+# ======================================================
+# MAIN
+# ======================================================
 def main():
+    print("🤖 Sofía iniciando…")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("correos", listar_correos))
     app.add_handler(CommandHandler("buscar", buscar_correos))
+    app.add_handler(CommandHandler("leer", leer_correo))
     app.add_handler(CommandHandler("resumen", resumen_correos))
-    app.add_handler(CommandHandler("leer", leer_correo))
-    app.add_handler(CommandHandler("leer", leer_correo))
-    app.add_handler(CommandHandler("adjunto", enviar_adjunto))
-    print("🤖 Sofía está lista para ayudarte con tus correos...")
+    app.add_handler(CommandHandler("hora", hora_actual))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder_texto))
+
+    print("🤖 Sofía LISTA (Render OK)")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
+
