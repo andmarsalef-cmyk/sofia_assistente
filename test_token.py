@@ -1,13 +1,18 @@
 import os
+import asyncio
 from dotenv import load_dotenv
-from sofia_telegram import verificar_token
+from telegram import Bot
 
-# Cargar variables de entorno
 load_dotenv("sofia.env")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-print("Probando verificación del token...")
-if verificar_token(TELEGRAM_TOKEN):
-    print("✅ El token funciona correctamente.")
-else:
-    print("❌ El token NO es válido.")
+async def test_token():
+    try:
+        bot = Bot(token=TELEGRAM_TOKEN)
+        bot_info = await bot.get_me()
+        print(f"Token válido. Bot name: {bot_info.username}")
+    except Exception as e:
+        print(f"Error con el token: {str(e)}")
+
+if __name__ == "__main__":
+    asyncio.run(test_token())

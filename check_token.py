@@ -2,7 +2,7 @@ import asyncio
 from telegram import Bot
 
 # 🔹 Pega aquí el token que quieras probar
-TOKEN = "8400542436:AAE4kZ40qJKigZNEWDwrfuEVIsvGpSfWWew"
+TOKEN = "8587346244:AAGyt2KLBozmaO9r_F2Cj-3QDDDMTCZI3XE"
 
 async def check():
     try:

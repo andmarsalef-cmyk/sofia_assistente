@@ -1,13 +1,14 @@
 # ==========================================
 # Sofia Telegram Bot - Versión limpia Render
 # ==========================================
-print("=== SOFIA_DEPLOY_MARK_20251201 ===")
 import os
 import base64
 import logging
 from datetime import datetime
+
 from dotenv import load_dotenv
 from openai import OpenAI
+
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -22,17 +23,30 @@ from telegram.ext import (
 )
 
 # ========= Cargar entorno =========
-from dotenv import dotenv_values
+from dotenv import load_dotenv
+import os
+import logging
+from openai import OpenAI
 
-env = dotenv_values("sofia.env")
-for k, v in env.items():
-    os.environ[k] = v
+# Cargar variables desde sofia.env (local) o entorno Render
+load_dotenv("sofia.env")
+
+# Variables críticas
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-print("DEBUG — TELEGRAM_TOKEN leído:", TELEGRAM_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GMAIL_TOKEN_JSON = os.getenv("GMAIL_TOKEN_JSON")
 
+# Validaciones claras (fallar rápido)
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("❌ TELEGRAM_TOKEN no está definido")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("❌ OPENAI_API_KEY no está definido")
+
+# Cliente OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Logging
 logging.basicConfig(
     filename="sofia.log",
     level=logging.INFO,
@@ -40,14 +54,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Marca de arranque (visible en logs)
+print("=== SOFIA ENV CARGADO OK ===", flush=True)
+print("TELEGRAM_TOKEN existe?:", bool(TELEGRAM_TOKEN), flush=True)
+print("GMAIL_TOKEN_JSON existe?:", bool(GMAIL_TOKEN_JSON), flush=True)
 
 # ======================================================
-# 🔥 GMAIL SERVICE (VERSIÓN 100% COMPATIBLE CON RENDER)
+# 🔥 GMAIL SERVICE (100% Render-safe, SIN navegador)
 # ======================================================
 def get_gmail_service():
     """
-    Gmail service SIN navegador (Render-safe).
-    Usa GMAIL_TOKEN_JSON (un JSON en una sola línea) y refresca con refresh_token.
+    Gmail service SIN navegador.
+    Lee GMAIL_TOKEN_JSON (JSON en una sola línea) y refresca con refresh_token.
     """
     import json
     from google.oauth2.credentials import Credentials
@@ -57,15 +75,16 @@ def get_gmail_service():
     SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
     token_json = os.getenv("GMAIL_TOKEN_JSON")
-    print("✅ DEBUG get_gmail_service: usando GMAIL_TOKEN_JSON + json.loads (sin navegador)")
     if not token_json:
         raise RuntimeError("Falta la variable de entorno GMAIL_TOKEN_JSON")
 
+    # Parsear JSON
     try:
         d = json.loads(token_json)
     except Exception as e:
         raise RuntimeError(f"GMAIL_TOKEN_JSON no es JSON válido: {e}")
 
+    # Construir credenciales (sin usar archivos, sin OAuth interactivo)
     creds = Credentials(
         token=d.get("token"),
         refresh_token=d.get("refresh_token"),
@@ -75,16 +94,17 @@ def get_gmail_service():
         scopes=SCOPES,
     )
 
-    # Refrescar si expira (SIN navegador)
+    # Refrescar si está expirado (SIN navegador)
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
 
-    # Si sigue inválido, fallar claro (y NO intentar navegador)
+    # Validación final
     if not creds.valid:
-        raise RuntimeError("Token Gmail inválido o sin refresh_token (no se puede refrescar sin navegador).")
+        raise RuntimeError(
+            "Token Gmail inválido o sin refresh_token (no se puede refrescar sin navegador)."
+        )
 
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
-
 # ======================================================
 # /correos – listar no leídos
 # ======================================================
@@ -93,7 +113,6 @@ correo_ids = []
 async def listar_correos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global correo_ids
 
-    # Mensaje inicial
     await update.message.reply_text("📥 Cargando correos, dame unos segundos...")
 
     try:
@@ -111,7 +130,7 @@ async def listar_correos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("📭 No tienes correos no leídos.")
             return
 
-        correo_ids = []  # reiniciar IDs
+        correo_ids = []
         lineas = ["📌 Últimos 5 correos no leídos:\n"]
 
         for i, msg in enumerate(messages, start=1):
@@ -125,7 +144,9 @@ async def listar_correos(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 metadataHeaders=["From", "Subject", "Date"]
             ).execute()
 
-            headers = {h["name"]: h["value"] for h in msg_data["payload"].get("headers", [])}
+            headers_list = msg_data.get("payload", {}).get("headers", [])
+            headers = {h.get("name"): h.get("value") for h in headers_list}
+
             remitente = headers.get("From", "Desconocido")
             asunto = headers.get("Subject", "Sin asunto")
             fecha = headers.get("Date", "Sin fecha")
